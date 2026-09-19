@@ -821,6 +821,11 @@ InnerIndexInterface::get_data_by_ids_with_flag(const int64_t* ids,
                                                uint64_t selected_data_flag,
                                                Vector<InnerIdType>& inner_ids) const {
     CHECK_ARGUMENT(count >= 0, "count must not be negative");
+    auto dataset = Dataset::Make();
+    dataset->NumElements(count)->Dim(dim_)->Owner(true, allocator_);
+    if (count == 0) {
+        return dataset;
+    }
     inner_ids.clear();
     inner_ids.reserve(static_cast<uint64_t>(count));
     {
@@ -829,10 +834,30 @@ InnerIndexInterface::get_data_by_ids_with_flag(const int64_t* ids,
             inner_ids.emplace_back(this->label_table_->GetIdByLabel(ids[i]));
         }
     }
-    auto thread_count = static_cast<int64_t>(this->build_thread_count_);
-    auto item_per_thread = (count + thread_count - 1) / thread_count;
-    auto dataset = Dataset::Make();
-    dataset->NumElements(count)->Dim(dim_)->Owner(true, allocator_);
+    auto run_task = [&](auto&& task_func) {
+        if (this->thread_pool_ != nullptr && this->build_thread_count_ > 1 && count > 1) {
+            auto worker_count = std::min(static_cast<int64_t>(this->build_thread_count_), count);
+            auto item_per_thread = (count + worker_count - 1) / worker_count;
+            std::vector<std::future<void>> futures;
+            futures.reserve(worker_count);
+            for (int64_t i = 0; i < worker_count; ++i) {
+                int64_t begin = i * item_per_thread;
+                if (begin >= count) {
+                    break;
+                }
+                int64_t end = std::min(begin + item_per_thread, count);
+                if (begin < end) {
+                    futures.emplace_back(this->thread_pool_->GeneralEnqueue(task_func, begin, end));
+                }
+            }
+            for (auto& future : futures) {
+                future.get();
+            }
+        } else {
+            task_func(0, count);
+        }
+    };
+
     if ((selected_data_flag & DATA_FLAG_FLOAT32_VECTOR) != 0U) {
         if (not this->has_raw_vector_) {
             throw VsagException(ErrorType::INVALID_ARGUMENT, "has_raw_vector_ is false");
@@ -845,19 +870,7 @@ InnerIndexInterface::get_data_by_ids_with_flag(const int64_t* ids,
                 this->GetVectorByInnerId(inner_ids[i], fp32_data + i * this->dim_);
             }
         };
-        if (this->thread_pool_ != nullptr) {
-            std::vector<std::future<void>> futures;
-            for (int64_t i = 0; i < thread_count; ++i) {
-                int64_t begin = i * item_per_thread;
-                int64_t end = std::min(begin + item_per_thread, count);
-                futures.emplace_back(this->thread_pool_->GeneralEnqueue(get_vec_func, begin, end));
-            }
-            for (auto& future : futures) {
-                future.get();
-            }
-        } else {
-            get_vec_func(0, count);
-        }
+        run_task(get_vec_func);
     }
 
     if ((selected_data_flag & DATA_FLAG_ATTRIBUTE) != 0U) {
@@ -871,19 +884,7 @@ InnerIndexInterface::get_data_by_ids_with_flag(const int64_t* ids,
                 this->GetAttributeSetByInnerId(inner_ids[i], attribute_data + i);
             }
         };
-        if (this->thread_pool_ != nullptr) {
-            std::vector<std::future<void>> futures;
-            for (int64_t i = 0; i < thread_count; ++i) {
-                int64_t begin = i * item_per_thread;
-                int64_t end = std::min(begin + item_per_thread, count);
-                futures.emplace_back(this->thread_pool_->GeneralEnqueue(get_attr_func, begin, end));
-            }
-            for (auto& future : futures) {
-                future.get();
-            }
-        } else {
-            get_attr_func(0, count);
-        }
+        run_task(get_attr_func);
     }
 
     if ((selected_data_flag & DATA_FLAG_EXTRA_INFO) != 0U) {
@@ -899,20 +900,7 @@ InnerIndexInterface::get_data_by_ids_with_flag(const int64_t* ids,
                                                      extra_info + i * extra_info_size_);
             }
         };
-        if (this->thread_pool_ != nullptr) {
-            std::vector<std::future<void>> futures;
-            for (int64_t i = 0; i < thread_count; ++i) {
-                int64_t begin = i * item_per_thread;
-                int64_t end = std::min(begin + item_per_thread, count);
-                futures.emplace_back(
-                    this->thread_pool_->GeneralEnqueue(get_extra_info_func, begin, end));
-            }
-            for (auto& future : futures) {
-                future.get();
-            }
-        } else {
-            get_extra_info_func(0, count);
-        }
+        run_task(get_extra_info_func);
     }
     if ((selected_data_flag & DATA_FLAG_ID) != 0U) {
         auto* new_ids =

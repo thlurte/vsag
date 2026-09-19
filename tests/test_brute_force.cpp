@@ -2079,3 +2079,86 @@ TEST_CASE("BruteForce distance stays consistent during force removal",
     REQUIRE_FALSE(failed.load());
     REQUIRE(index->GetNumElements() == 0);
 }
+
+TEST_CASE("GetDataByIds handles zero, one, and excess build_thread_count",
+          "[GetDataByIds][thread_count][brute_force]") {
+    for (bool has_external_pool : {false, true}) {
+        for (int64_t build_thread_count : {0, 1, 8}) {
+            std::string param = fmt::format(R"({{
+            "dtype": "float32",
+            "metric_type": "l2",
+            "dim": 4,
+            "index_param": {{
+                "base_quantization_type": "fp32",
+                "store_raw_vector": true,
+                "thread_count": {}
+            }}
+        }})",
+                                            build_thread_count);
+
+            auto pool =
+                has_external_pool ? vsag::SafeThreadPool::FactoryDefaultThreadPool() : nullptr;
+            if (pool != nullptr) {
+                pool->SetPoolSize(4);
+            }
+            vsag::Resource resource(nullptr, pool);
+            vsag::Engine engine(&resource);
+            auto made = has_external_pool ? engine.CreateIndex("brute_force", param)
+                                          : vsag::Factory::CreateIndex("brute_force", param);
+            REQUIRE(made.has_value());
+            auto index = made.value();
+
+            constexpr int64_t count = 4;
+            std::vector<int64_t> ids = {10, 20, 30, 40};
+            std::vector<float> vectors = {1.0F,
+                                          2.0F,
+                                          3.0F,
+                                          4.0F,
+                                          5.0F,
+                                          6.0F,
+                                          7.0F,
+                                          8.0F,
+                                          9.0F,
+                                          10.0F,
+                                          11.0F,
+                                          12.0F,
+                                          13.0F,
+                                          14.0F,
+                                          15.0F,
+                                          16.0F};
+            auto base = vsag::Dataset::Make()
+                            ->Owner(false)
+                            ->NumElements(count)
+                            ->Dim(4)
+                            ->Ids(ids.data())
+                            ->Float32Vectors(vectors.data());
+            REQUIRE(index->Build(base).has_value());
+
+            // 1. Test count == 0 returns empty dataset
+            auto empty_res = index->GetDataByIds(ids.data(), 0);
+            REQUIRE(empty_res.has_value());
+            REQUIRE(empty_res.value()->GetNumElements() == 0);
+
+            // 2. Test single ID query (count == 1 < build_thread_count when build_thread_count == 8)
+            int64_t single_id = 20;
+            auto single_res = index->GetDataByIds(&single_id, 1);
+            REQUIRE(single_res.has_value());
+            REQUIRE(single_res.value()->GetNumElements() == 1);
+            REQUIRE(single_res.value()->GetIds()[0] == single_id);
+            REQUIRE(memcmp(single_res.value()->GetFloat32Vectors(),
+                           vectors.data() + 4,
+                           4 * sizeof(float)) == 0);
+
+            // 3. Test multiple IDs query
+            auto multi_res = index->GetDataByIds(ids.data(), count);
+            REQUIRE(multi_res.has_value());
+            REQUIRE(multi_res.value()->GetNumElements() == count);
+            for (int64_t i = 0; i < count; ++i) {
+                REQUIRE(multi_res.value()->GetIds()[i] == ids[i]);
+                REQUIRE(memcmp(multi_res.value()->GetFloat32Vectors() + i * 4,
+                               vectors.data() + i * 4,
+                               4 * sizeof(float)) == 0);
+            }
+        }
+    }
+}
